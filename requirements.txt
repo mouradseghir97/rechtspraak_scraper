@@ -1,6 +1,6 @@
-azure-functions
+azure-functions==1.20.0
 azure-cosmos
-azure-storage-blob
+azure-storage-blob==12.22.0
 
-requests
-urllib3
+requests==2.32.3
+urllib3==2.2.3
