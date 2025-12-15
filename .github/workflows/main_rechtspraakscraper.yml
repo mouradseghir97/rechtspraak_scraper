@@ -72,6 +72,6 @@ jobs:
           app-name: 'rechtspraakscraper'
           slot-name: 'Production'
           package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_CC41E785486B412B838C837FCB8E73F6 }}
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_FC2008C975F44E1B8651773EDD4D7CEB }}
           sku: 'flexconsumption'
         
