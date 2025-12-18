@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 env:
-  AZURE_FUNCTIONAPP_PACKAGE_PATH: '.'   # folder that contains host.json, function_app.py, requirements.txt
+  AZURE_FUNCTIONAPP_PACKAGE_PATH: '.'   # folder with host.json, function_app.py, requirements.txt
   PYTHON_VERSION: '3.13'
 
 jobs:
@@ -20,26 +20,34 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Optional: set up Python if you want to run tests / lint
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
+      # Install dependencies into .python_packages (this is what Azure Functions Python runtime uses)
+      - name: Install dependencies into .python_packages
+        run: |
+          python -m pip install --upgrade pip
+          mkdir -p .python_packages/lib/site-packages
+          pip install -r requirements.txt -t .python_packages/lib/site-packages
+
       # Optional: run tests here if you want
-      # - name: Install dependencies for tests
-      #   run: pip install -r requirements.txt
       # - name: Run tests
       #   run: pytest
 
-      - name: Deploy to Azure Functions (with remote build)
+      # Zip everything, including .python_packages
+      - name: Create deployment zip
+        run: |
+          zip -r release.zip . \
+            -x "venv/*" ".git/*" ".github/*" "__pycache__/*"
+
+      - name: Deploy to Azure Functions
         uses: Azure/functions-action@v1
         id: deploy-to-function
         with:
-          app-name: 'rechtspraakscraper'
+          app-name: 'rechtspraakscraper'  # your Function App name
           slot-name: 'Production'
-          package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
+          package: 'release.zip'
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_C29C25CF2383418581DD8C82B2CCBD57 }}
           sku: 'flexconsumption'
-          scm-do-build-during-deployment: true     # 🔴 enable Oryx / remote build
-          enable-oryx-build: true                  # 🔴 explicitly turn on Oryx
