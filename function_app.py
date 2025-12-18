@@ -1,17 +1,17 @@
 import logging
-import os
-import time
-import random
-import datetime
-import xml.etree.ElementTree as ET
-from urllib.parse import urlencode
+# import os
+# import time
+# import random
+# import datetime
+# import xml.etree.ElementTree as ET
+# from urllib.parse import urlencode
 
 import azure.functions as func
-from azure.cosmos import CosmosClient, PartitionKey
-from azure.storage.blob import BlobServiceClient
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+# from azure.cosmos import CosmosClient, PartitionKey
+# from azure.storage.blob import BlobServiceClient
+# import requests
+# from requests.adapters import HTTPAdapter
+# from urllib3.util.retry import Retry
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
