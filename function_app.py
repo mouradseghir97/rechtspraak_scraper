@@ -4,14 +4,15 @@ import time
 import random
 import datetime
 import xml.etree.ElementTree as ET
-from urllib.parse import urlencode
 
 import azure.functions as func
 from azure.cosmos import CosmosClient, PartitionKey
+from azure.cosmos import exceptions as cosmos_exceptions
 from azure.storage.blob import BlobServiceClient
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from bs4 import BeautifulSoup
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -25,10 +26,6 @@ COSMOS_CONTAINER_NAME = os.environ.get("COSMOS_CONTAINER_NAME", "Uitspraken")
 BLOB_CONNECTION_STRING = os.environ.get("BLOB_CONNECTION_STRING")
 BLOB_CONTAINER_NAME = os.environ.get("BLOB_CONTAINER_NAME", "rechtspraak-xml")
 
-# Scraper Settings
-# Defaulting to 2025 to keep execution time manageable. Change via App Settings.
-START_DATE = os.environ.get("SEARCH_START_DATE", "2025-01-01")
-END_DATE = os.environ.get("SEARCH_END_DATE", "2025-12-31")
 SUBJECT = os.environ.get("SEARCH_SUBJECT", "http://psi.rechtspraak.nl/rechtsgebied#bestuursrecht_belastingrecht")
 
 BASE_SEARCH = "https://data.rechtspraak.nl/uitspraken/zoeken"
@@ -119,15 +116,48 @@ def fetch_full_text(ecli: str) -> str:
         logging.error(f"Failed to fetch text for {ecli}: {e}")
         return ""
 
+def extract_clean_text(xml_content: str) -> str:
+    """Extracts readable text from the Rechtspraak XML, dropping the coding tags."""
+    if not xml_content:
+        return ""
+    try:
+        # Use BeautifulSoup to parse the XML cleanly
+        soup = BeautifulSoup(xml_content, "xml")
+        
+        # The actual ruling is usually inside <uitspraak> or <conclusie>
+        content_node = soup.find('uitspraak') or soup.find('conclusie')
+        
+        if content_node:
+            text = content_node.get_text(separator="\n\n", strip=True)
+        else:
+            # Fallback if specific tags are missing
+            text = soup.get_text(separator="\n\n", strip=True)
+            
+        # Cosmos DB has a 2MB item limit. Cap text at ~500,000 characters 
+        # to ensure it never crashes the database insert.
+        return text[:500000] 
+    except Exception as e:
+        logging.warning(f"Failed to extract clean text: {e}")
+        return ""
+
 # ---------------------------------------------------------------------------
 # MAIN TIMER TRIGGER
 # ---------------------------------------------------------------------------
-@app.schedule(schedule="0 0 4 * * *", arg_name="myTimer", run_on_startup=False,
-              use_monitor=False) 
+@app.schedule(schedule="0 0 4 * * *", arg_name="myTimer", run_on_startup=False, use_monitor=False) 
 def rechtspraak_scraper(myTimer: func.TimerRequest) -> None:
     logging.info('🚀 Rechtspraak Scraper started.')
 
-    # 1. Initialize Azure Clients
+    # 1. Calculate Dynamic Date Window (Last 7 Days)
+    today = datetime.date.today()
+    default_start = (today - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+    default_end = today.strftime("%Y-%m-%d")
+    
+    start_date_str = os.environ.get("SEARCH_START_DATE", default_start)
+    end_date_str = os.environ.get("SEARCH_END_DATE", default_end)
+    
+    logging.info(f"📅 Scraping window: {start_date_str} to {end_date_str}")
+
+    # 2. Initialize Azure Clients
     try:
         # Cosmos DB
         cosmos_client = CosmosClient(COSMOS_ENDPOINT, credential=COSMOS_KEY)
@@ -144,7 +174,7 @@ def rechtspraak_scraper(myTimer: func.TimerRequest) -> None:
         logging.error(f"❌ Failed to initialize Azure Clients. Check env vars. Error: {e}")
         return
 
-    # 2. Start Ingestion Loop
+    # 3. Start Ingestion Loop
     offset = 0
     total_processed = 0
     
@@ -156,10 +186,10 @@ def rechtspraak_scraper(myTimer: func.TimerRequest) -> None:
             ("subject", SUBJECT),
             ("max", PAGE_SIZE),
             ("from", offset),
-            ("date", START_DATE),
-            ("date", END_DATE),
+            ("date", start_date_str),
+            ("date", end_date_str),
             ("return", "DOC"),
-            ("sort", "ASC"), # Oldest first
+            ("sort", "DESC"), 
         ]
         
         try:
@@ -171,7 +201,7 @@ def rechtspraak_scraper(myTimer: func.TimerRequest) -> None:
             break
 
         if not entries:
-            logging.info("✅ No more entries found. Scraping complete.")
+            logging.info("✅ No more entries found for this time window. Scraping complete.")
             break
 
         logging.info(f"Processing {len(entries)} items...")
@@ -185,24 +215,28 @@ def rechtspraak_scraper(myTimer: func.TimerRequest) -> None:
                 continue
 
             # --- Check if exists in Cosmos (Idempotency) ---
-            # To save time/money, you can skip if already exists.
-            # Comment this block out if you want to force-update every time.
             try:
                 container.read_item(item=ecli, partition_key=ecli)
-                logging.info(f"Skipping existing ECLI: {ecli}")
+                logging.info(f"⏭️ Skipping existing ECLI: {ecli}")
                 continue 
-            except Exception:
+            except cosmos_exceptions.CosmosResourceNotFoundError:
                 pass # Item does not exist, proceed
+            except Exception as e:
+                logging.error(f"⚠️ Unexpected Cosmos read error for {ecli}: {e}")
+                continue
 
             # --- 1. Fetch Metadata (Date) ---
             judgment_date = get_judgment_date_for_ecli(ecli)
             
-            # --- 2. Fetch Full Text ---
+            # --- 2. Fetch Full Text XML ---
             full_text_xml = fetch_full_text(ecli)
+            
+            # --- 3. Extract Clean Text for Database ---
+            clean_text = extract_clean_text(full_text_xml)
             
             blob_url = None
             if full_text_xml:
-                # --- 3. Upload to Blob ---
+                # --- 4. Upload raw XML to Blob Storage ---
                 blob_filename = f"{ecli}.xml"
                 try:
                     blob_client = blob_container_client.get_blob_client(blob_filename)
@@ -211,14 +245,20 @@ def rechtspraak_scraper(myTimer: func.TimerRequest) -> None:
                 except Exception as e:
                     logging.error(f"Blob upload failed for {ecli}: {e}")
 
-            # --- 4. Upsert to Cosmos ---
+            # --- 5. Generate Official Public URL ---
+            public_url = f"https://uitspraken.rechtspraak.nl/details?id={ecli}"
+
+            # --- 6. Upsert to Cosmos ---
             item = {
-                "id": ecli, # Partition Key
+                "id": ecli, 
                 "ecli": ecli,
                 "title": title,
                 "summary": summary,
+                "full_text": clean_text,           # The clean, readable article
+                "text_length": len(clean_text),
                 "judgment_date": judgment_date,
-                "blob_url": blob_url,
+                "public_url": public_url,          # The clickable website link
+                "blob_xml_url": blob_url,          # The raw backup link
                 "subject": SUBJECT,
                 "scraped_at": datetime.datetime.utcnow().isoformat()
             }
@@ -234,7 +274,9 @@ def rechtspraak_scraper(myTimer: func.TimerRequest) -> None:
 
         offset += PAGE_SIZE
         
-        # Safety break for Function execution time limits (optional but recommended)
-        # if total_processed > 2000: break 
+        # Safety break for Function execution time limits
+        if total_processed > 2000:
+            logging.warning("⚠️ Reached max processing limit for one run (2000). Breaking early.")
+            break 
 
     logging.info(f"🏁 Run Finished. Total documents processed: {total_processed}")
