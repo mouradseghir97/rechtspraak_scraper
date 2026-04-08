@@ -6,7 +6,7 @@ import datetime
 import xml.etree.ElementTree as ET
 
 import azure.functions as func
-from azure.cosmos import CosmosClient, PartitionKey
+from azure.cosmos import CosmosClient
 from azure.cosmos import exceptions as cosmos_exceptions
 from azure.storage.blob import BlobServiceClient
 import requests
@@ -17,7 +17,6 @@ from bs4 import BeautifulSoup
 # ---------------------------------------------------------------------------
 # CONFIGURATION
 # ---------------------------------------------------------------------------
-# Env Vars (set these in Azure Portal)
 COSMOS_ENDPOINT = os.environ.get("COSMOS_ENDPOINT")
 COSMOS_KEY = os.environ.get("COSMOS_KEY")
 COSMOS_DATABASE_NAME = os.environ.get("COSMOS_DATABASE_NAME", "RechtspraakDB")
@@ -26,7 +25,10 @@ COSMOS_CONTAINER_NAME = os.environ.get("COSMOS_CONTAINER_NAME", "Uitspraken")
 BLOB_CONNECTION_STRING = os.environ.get("BLOB_CONNECTION_STRING")
 BLOB_CONTAINER_NAME = os.environ.get("BLOB_CONTAINER_NAME", "rechtspraak-xml")
 
-SUBJECT = os.environ.get("SEARCH_SUBJECT", "http://psi.rechtspraak.nl/rechtsgebied#bestuursrecht_belastingrecht")
+SUBJECT = os.environ.get(
+    "SEARCH_SUBJECT",
+    "http://psi.rechtspraak.nl/rechtsgebied#bestuursrecht_belastingrecht",
+)
 
 BASE_SEARCH = "https://data.rechtspraak.nl/uitspraken/zoeken"
 BASE_CONTENT = "https://data.rechtspraak.nl/uitspraken/content"
@@ -36,6 +38,7 @@ DCT_NS = {"dcterms": "http://purl.org/dc/terms/"}
 
 PAGE_SIZE = 100
 REQUEST_TIMEOUT = 60
+MAX_ITEMS_PER_RUN = int(os.environ.get("MAX_ITEMS_PER_RUN", "2000"))
 
 app = func.FunctionApp()
 
@@ -44,10 +47,12 @@ app = func.FunctionApp()
 # ---------------------------------------------------------------------------
 def get_session():
     session = requests.Session()
-    session.headers.update({
-        "User-Agent": "AzureFunction/1.0 (contact: admin@example.com)",
-        "Accept": "application/xml,text/xml;q=0.9,*/*;q=0.8",
-    })
+    session.headers.update(
+        {
+            "User-Agent": "AzureFunction/1.1 (contact: admin@example.com)",
+            "Accept": "application/xml,text/xml;q=0.9,*/*;q=0.8",
+        }
+    )
     retries = Retry(
         total=5,
         backoff_factor=0.6,
@@ -58,130 +63,134 @@ def get_session():
     session.mount("https://", HTTPAdapter(max_retries=retries))
     return session
 
+
 session = get_session()
 
 # ---------------------------------------------------------------------------
-# HELPER FUNCTIONS
+# HELPERS
 # ---------------------------------------------------------------------------
-def fetch_with_backoff(url: str, params: dict | list | None = None):
-    """Fetches URL with robust retry and backoff logic."""
+def fetch_with_backoff(url: str, params=None):
     for attempt in range(6):
         try:
-            r = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
-            
-            # Custom handling for specific rate limits
-            if r.status_code in (403, 429, 503):
-                ra = r.headers.get("Retry-After")
-                sleep_time = int(ra) if (ra and ra.isdigit()) else (2 + attempt + random.random())
-                logging.warning(f"⚠️ Rate limited. Sleeping {sleep_time}s")
+            response = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+
+            if response.status_code in (403, 429, 503):
+                retry_after = response.headers.get("Retry-After")
+                sleep_time = int(retry_after) if (retry_after and retry_after.isdigit()) else (2 + attempt + random.random())
+                logging.warning("Rate limited for %s. Sleeping %.2fs", url, sleep_time)
                 time.sleep(sleep_time)
                 continue
-            
-            r.raise_for_status()
-            return r
-        except requests.HTTPError as e:
+
+            response.raise_for_status()
+            return response
+        except requests.HTTPError as exc:
             if attempt == 5:
-                raise e
+                raise exc
             time.sleep(1.5 + attempt * 0.7 + random.random())
     return None
+
 
 def parse_date(text: str):
     if not text:
         return None
-    txt = text.strip()
-    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%z"):
-        try:
-            return datetime.datetime.strptime(txt, fmt).isoformat()
-        except ValueError:
-            pass
-    return None
 
-def get_judgment_date_for_ecli(ecli: str):
-    """Fetches metadata to extract the exact judgment date."""
+    raw = text.strip()
+    formats = (
+        "%Y-%m-%d",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S%z",
+    )
+    for fmt in formats:
+        try:
+            return datetime.datetime.strptime(raw, fmt).isoformat()
+        except ValueError:
+            continue
+
     try:
-        r = fetch_with_backoff(BASE_CONTENT, {"id": ecli, "return": "META"})
-        root = ET.fromstring(r.content)
-        dt_text = root.findtext(".//dcterms:date", namespaces=DCT_NS)
-        return parse_date(dt_text)
-    except Exception as e:
-        logging.warning(f"Could not parse date for {ecli}: {e}")
+        return datetime.datetime.fromisoformat(raw.replace("Z", "+00:00")).isoformat()
+    except Exception:
         return None
 
-def fetch_full_text(ecli: str) -> str:
-    """Fetches the full XML content of the judgment."""
+
+def get_judgment_date_for_ecli(ecli: str):
     try:
-        r = fetch_with_backoff(BASE_CONTENT, {"id": ecli})
-        return r.text  # Storing the raw XML text
-    except Exception as e:
-        logging.error(f"Failed to fetch text for {ecli}: {e}")
+        response = fetch_with_backoff(BASE_CONTENT, {"id": ecli, "return": "META"})
+        root = ET.fromstring(response.content)
+        dt_text = root.findtext(".//dcterms:date", namespaces=DCT_NS)
+        return parse_date(dt_text)
+    except Exception as exc:
+        logging.warning("Could not parse date for %s: %s", ecli, exc)
+        return None
+
+
+def fetch_full_text(ecli: str) -> str:
+    try:
+        response = fetch_with_backoff(BASE_CONTENT, {"id": ecli})
+        return response.text
+    except Exception as exc:
+        logging.error("Failed to fetch text for %s: %s", ecli, exc)
         return ""
 
+
 def extract_clean_text(xml_content: str) -> str:
-    """Extracts readable text from the Rechtspraak XML, dropping the coding tags."""
     if not xml_content:
         return ""
+
     try:
-        # Use BeautifulSoup to parse the XML cleanly
         soup = BeautifulSoup(xml_content, "xml")
-        
-        # The actual ruling is usually inside <uitspraak> or <conclusie>
-        content_node = soup.find('uitspraak') or soup.find('conclusie')
-        
+        content_node = soup.find("uitspraak") or soup.find("conclusie")
+
         if content_node:
             text = content_node.get_text(separator="\n\n", strip=True)
         else:
-            # Fallback if specific tags are missing
             text = soup.get_text(separator="\n\n", strip=True)
-            
-        # Cosmos DB has a 2MB item limit. Cap text at ~500,000 characters 
-        # to ensure it never crashes the database insert.
-        return text[:500000] 
-    except Exception as e:
-        logging.warning(f"Failed to extract clean text: {e}")
+
+        return text[:500000]
+    except Exception as exc:
+        logging.warning("Failed to extract clean text: %s", exc)
         return ""
+
+
+def safe_partition_key(ecli: str) -> str:
+    # Adjust this only if your Cosmos container partition key is not /id.
+    return ecli
+
 
 # ---------------------------------------------------------------------------
 # MAIN TIMER TRIGGER
 # ---------------------------------------------------------------------------
-@app.schedule(schedule="0 0 4 * * *", arg_name="myTimer", run_on_startup=False, use_monitor=False) 
+@app.schedule(schedule="0 0 4 * * *", arg_name="myTimer", run_on_startup=False, use_monitor=False)
 def rechtspraak_scraper(myTimer: func.TimerRequest) -> None:
-    logging.info('🚀 Rechtspraak Scraper started.')
+    logging.info("Rechtspraak Scraper started.")
 
-    # 1. Calculate Dynamic Date Window (Last 7 Days)
     today = datetime.date.today()
     default_start = (today - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
     default_end = today.strftime("%Y-%m-%d")
-    
+
     start_date_str = os.environ.get("SEARCH_START_DATE", default_start)
     end_date_str = os.environ.get("SEARCH_END_DATE", default_end)
-    
-    logging.info(f"📅 Scraping window: {start_date_str} to {end_date_str}")
 
-    # 2. Initialize Azure Clients
+    logging.info("Scraping window: %s to %s", start_date_str, end_date_str)
+
     try:
-        # Cosmos DB
         cosmos_client = CosmosClient(COSMOS_ENDPOINT, credential=COSMOS_KEY)
         database = cosmos_client.get_database_client(COSMOS_DATABASE_NAME)
         container = database.get_container_client(COSMOS_CONTAINER_NAME)
 
-        # Blob Storage
         blob_service_client = BlobServiceClient.from_connection_string(BLOB_CONNECTION_STRING)
         blob_container_client = blob_service_client.get_container_client(BLOB_CONTAINER_NAME)
         if not blob_container_client.exists():
             blob_container_client.create_container()
-
-    except Exception as e:
-        logging.error(f"❌ Failed to initialize Azure Clients. Check env vars. Error: {e}")
+    except Exception as exc:
+        logging.error("Failed to initialize Azure clients: %s", exc)
         return
 
-    # 3. Start Ingestion Loop
     offset = 0
     total_processed = 0
-    
+
     while True:
-        logging.info(f"🔎 Fetching feed offset: {offset}")
-        
-        # Build Search Query
+        logging.info("Fetching feed offset: %s", offset)
+
         params = [
             ("subject", SUBJECT),
             ("max", PAGE_SIZE),
@@ -189,22 +198,22 @@ def rechtspraak_scraper(myTimer: func.TimerRequest) -> None:
             ("date", start_date_str),
             ("date", end_date_str),
             ("return", "DOC"),
-            ("sort", "DESC"), 
+            ("sort", "DESC"),
         ]
-        
+
         try:
-            r = fetch_with_backoff(BASE_SEARCH, params)
-            root = ET.fromstring(r.content)
+            response = fetch_with_backoff(BASE_SEARCH, params)
+            root = ET.fromstring(response.content)
             entries = root.findall("atom:entry", ATOM_NS)
-        except Exception as e:
-            logging.error(f"❌ Critical error fetching feed: {e}")
+        except Exception as exc:
+            logging.error("Critical error fetching feed: %s", exc)
             break
 
         if not entries:
-            logging.info("✅ No more entries found for this time window. Scraping complete.")
+            logging.info("No more entries found for this time window.")
             break
 
-        logging.info(f"Processing {len(entries)} items...")
+        logging.info("Processing %s items", len(entries))
 
         for entry in entries:
             ecli = (entry.findtext("atom:id", namespaces=ATOM_NS) or "").strip()
@@ -214,69 +223,65 @@ def rechtspraak_scraper(myTimer: func.TimerRequest) -> None:
             if not ecli:
                 continue
 
-            # --- Check if exists in Cosmos (Idempotency) ---
             try:
-                container.read_item(item=ecli, partition_key=ecli)
-                logging.info(f"⏭️ Skipping existing ECLI: {ecli}")
-                continue 
+                container.read_item(item=ecli, partition_key=safe_partition_key(ecli))
+                logging.info("Skipping existing ECLI: %s", ecli)
+                continue
             except cosmos_exceptions.CosmosResourceNotFoundError:
-                pass # Item does not exist, proceed
-            except Exception as e:
-                logging.error(f"⚠️ Unexpected Cosmos read error for {ecli}: {e}")
+                pass
+            except Exception as exc:
+                logging.error("Unexpected Cosmos read error for %s: %s", ecli, exc)
                 continue
 
-            # --- 1. Fetch Metadata (Date) ---
             judgment_date = get_judgment_date_for_ecli(ecli)
-            
-            # --- 2. Fetch Full Text XML ---
             full_text_xml = fetch_full_text(ecli)
-            
-            # --- 3. Extract Clean Text for Database ---
             clean_text = extract_clean_text(full_text_xml)
-            
+
             blob_url = None
             if full_text_xml:
-                # --- 4. Upload raw XML to Blob Storage ---
                 blob_filename = f"{ecli}.xml"
                 try:
                     blob_client = blob_container_client.get_blob_client(blob_filename)
                     blob_client.upload_blob(full_text_xml, overwrite=True)
                     blob_url = blob_client.url
-                except Exception as e:
-                    logging.error(f"Blob upload failed for {ecli}: {e}")
+                except Exception as exc:
+                    logging.error("Blob upload failed for %s: %s", ecli, exc)
 
-            # --- 5. Generate Official Public URL ---
             public_url = f"https://uitspraken.rechtspraak.nl/details?id={ecli}"
 
-            # --- 6. Upsert to Cosmos ---
             item = {
-                "id": ecli, 
+                "id": ecli,
                 "ecli": ecli,
                 "title": title,
                 "summary": summary,
-                "full_text": clean_text,           # The clean, readable article
+                "full_text": clean_text,
                 "text_length": len(clean_text),
                 "judgment_date": judgment_date,
-                "public_url": public_url,          # The clickable website link
-                "blob_xml_url": blob_url,          # The raw backup link
+                "published_at": judgment_date,
+                "date": judgment_date,
+                "public_url": public_url,
+                "source_url": public_url,
+                "blob_xml_url": blob_url,
                 "subject": SUBJECT,
-                "scraped_at": datetime.datetime.utcnow().isoformat()
+                "source_domain": "rechtspraak.nl",
+                "scraped_at": datetime.datetime.utcnow().isoformat(),
             }
-            
+
             try:
                 container.upsert_item(item)
                 total_processed += 1
-            except Exception as e:
-                logging.error(f"Cosmos upsert failed for {ecli}: {e}")
+            except Exception as exc:
+                logging.error("Cosmos upsert failed for %s: %s", ecli, exc)
 
-            # Polite delay between items
             time.sleep(0.1)
 
-        offset += PAGE_SIZE
-        
-        # Safety break for Function execution time limits
-        if total_processed > 2000:
-            logging.warning("⚠️ Reached max processing limit for one run (2000). Breaking early.")
-            break 
+            if total_processed >= MAX_ITEMS_PER_RUN:
+                logging.warning("Reached max processing limit for one run (%s).", MAX_ITEMS_PER_RUN)
+                break
 
-    logging.info(f"🏁 Run Finished. Total documents processed: {total_processed}")
+        if total_processed >= MAX_ITEMS_PER_RUN:
+            break
+
+        offset += PAGE_SIZE
+
+    logging.info("Run finished. Total documents processed: %s", total_processed)
