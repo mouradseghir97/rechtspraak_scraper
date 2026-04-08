@@ -3,7 +3,6 @@ import os
 import time
 import random
 import datetime
-import xml.etree.ElementTree as ET
 
 import azure.functions as func
 from azure.cosmos import CosmosClient
@@ -33,9 +32,6 @@ SUBJECT = os.environ.get(
 BASE_SEARCH = "https://data.rechtspraak.nl/uitspraken/zoeken"
 BASE_CONTENT = "https://data.rechtspraak.nl/uitspraken/content"
 
-ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
-DCT_NS = {"dcterms": "http://purl.org/dc/terms/"}
-
 PAGE_SIZE = 100
 REQUEST_TIMEOUT = 60
 MAX_ITEMS_PER_RUN = int(os.environ.get("MAX_ITEMS_PER_RUN", "2000"))
@@ -63,7 +59,6 @@ def get_session():
     session.mount("https://", HTTPAdapter(max_retries=retries))
     return session
 
-
 session = get_session()
 
 # ---------------------------------------------------------------------------
@@ -89,7 +84,6 @@ def fetch_with_backoff(url: str, params=None):
             time.sleep(1.5 + attempt * 0.7 + random.random())
     return None
 
-
 def parse_date(text: str):
     if not text:
         return None
@@ -111,26 +105,30 @@ def parse_date(text: str):
     except Exception:
         return None
 
-
 def get_judgment_date_for_ecli(ecli: str):
     try:
         response = fetch_with_backoff(BASE_CONTENT, {"id": ecli, "return": "META"})
-        root = ET.fromstring(response.content)
-        dt_text = root.findtext(".//dcterms:date", namespaces=DCT_NS)
-        return parse_date(dt_text)
+        if not response:
+            return None
+        
+        # Namespace agnostic parsing
+        soup = BeautifulSoup(response.content, "xml")
+        date_node = soup.find(lambda tag: tag.name and "date" in tag.name.lower())
+        
+        if date_node:
+            return parse_date(date_node.text)
+        return None
     except Exception as exc:
         logging.warning("Could not parse date for %s: %s", ecli, exc)
         return None
 
-
 def fetch_full_text(ecli: str) -> str:
     try:
         response = fetch_with_backoff(BASE_CONTENT, {"id": ecli})
-        return response.text
+        return response.text if response else ""
     except Exception as exc:
         logging.error("Failed to fetch text for %s: %s", ecli, exc)
         return ""
-
 
 def extract_clean_text(xml_content: str) -> str:
     if not xml_content:
@@ -138,23 +136,27 @@ def extract_clean_text(xml_content: str) -> str:
 
     try:
         soup = BeautifulSoup(xml_content, "xml")
-        content_node = soup.find("uitspraak") or soup.find("conclusie")
+        
+        # Agnostic search: handles both standard and prefixed nodes
+        content_node = soup.find(lambda tag: tag.name and tag.name.lower() in ["uitspraak", "conclusie"])
 
         if content_node:
             text = content_node.get_text(separator="\n\n", strip=True)
         else:
-            text = soup.get_text(separator="\n\n", strip=True)
+            # Fallback: grab all paragraph-like tags if the root node structure changed
+            paras = soup.find_all(lambda tag: tag.name and tag.name.lower() in ["para", "parablock", "title"])
+            if paras:
+                text = "\n\n".join([p.get_text(strip=True) for p in paras])
+            else:
+                text = soup.get_text(separator="\n\n", strip=True)
 
         return text[:500000]
     except Exception as exc:
         logging.warning("Failed to extract clean text: %s", exc)
         return ""
 
-
 def safe_partition_key(ecli: str) -> str:
-    # Adjust this only if your Cosmos container partition key is not /id.
     return ecli
-
 
 # ---------------------------------------------------------------------------
 # MAIN TIMER TRIGGER
@@ -203,8 +205,13 @@ def rechtspraak_scraper(myTimer: func.TimerRequest) -> None:
 
         try:
             response = fetch_with_backoff(BASE_SEARCH, params)
-            root = ET.fromstring(response.content)
-            entries = root.findall("atom:entry", ATOM_NS)
+            if not response:
+                break
+                
+            # Agnostic parsing for the ATOM feed
+            soup = BeautifulSoup(response.content, "xml")
+            entries = soup.find_all(lambda tag: tag.name and tag.name.lower() == "entry")
+            
         except Exception as exc:
             logging.error("Critical error fetching feed: %s", exc)
             break
@@ -216,9 +223,13 @@ def rechtspraak_scraper(myTimer: func.TimerRequest) -> None:
         logging.info("Processing %s items", len(entries))
 
         for entry in entries:
-            ecli = (entry.findtext("atom:id", namespaces=ATOM_NS) or "").strip()
-            title = (entry.findtext("atom:title", namespaces=ATOM_NS) or "").strip()
-            summary = (entry.findtext("atom:summary", namespaces=ATOM_NS) or "").strip()
+            id_node = entry.find(lambda tag: tag.name and tag.name.lower() == "id")
+            title_node = entry.find(lambda tag: tag.name and tag.name.lower() == "title")
+            summary_node = entry.find(lambda tag: tag.name and tag.name.lower() == "summary")
+            
+            ecli = id_node.text.strip() if id_node else ""
+            title = title_node.text.strip() if title_node else ""
+            summary = summary_node.text.strip() if summary_node else ""
 
             if not ecli:
                 continue
