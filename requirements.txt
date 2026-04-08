@@ -1,6 +1,10 @@
 azure-functions==1.20.0
-azure-cosmos
+azure-cosmos==4.6.0
 azure-storage-blob==12.22.0
 
 requests==2.32.3
 urllib3==2.2.3
+
+# Added for XML parsing and text cleaning
+beautifulsoup4==4.12.3
+lxml==5.3.0
